@@ -1,0 +1,16 @@
+# Binaries
+QuickCopy*.exe
+*.o
+
+# Config / Data
+links.json
+
+# Build
+build.bat
+
+# Manifest
+app.manifest
+app.rc
+
+# Git
+.git/
