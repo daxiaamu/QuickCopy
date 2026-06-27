@@ -24,37 +24,31 @@ x86_64-w64-mingw32-gcc -O2 -mwindows -o QuickCopy.exe quick_copy.c json_helper.c
 
 ## 使用
 
-在 exe 同目录下放 `links.json`，运行 QuickCopy.exe 即可。
+在 exe 同目录下放 `links.json`，运行 QuickCopy.exe 即可。支持 UTF-8 和 GBK 编码（自动检测），可以放任意多条。
 
-### links.json 格式
+### links.json 示例
 
 ```json
 [
     {
-        "name": "仅提供远程服务",
-        "content": "抱歉我这只提供远程服务，你联系我的页面上有事先说明。"
+        "name": "Button A",
+        "content": "https://example.com/link1"
     },
     {
-        "name": "修改UA",
-        "content": "pan.baidu.com"
+        "name": "Button B",
+        "content": "Some text to copy"
     },
     {
-        "name": "Winrar",
-        "content": "https://www.win-rar.com/fileadmin/winrar-versions/winrar/winrar-x64-712.exe"
+        "name": "Button C",
+        "content": "https://example.com/link2"
     },
     {
-        "name": "一加全能工具箱",
-        "content": "https://api.optool.daxiaamu.com/optool/pctool_latest.php"
+        "name": "Button D",
+        "content": "Another sample text"
     },
     {
-        "name": "打开USB调试",
-        "content": "两个方法二选一：1）长按电源键打开小布对话，告诉它打开USB调试。2）手动方法：看视频的第20~45秒：https://www.bilibili.com/video/BV1gm421G7jB/"
-    },
-    {
-        "name": "禁用更新",
-        "content": "系统设置——应用管理——右上角显示系统应用，搜索找到【软件更新】——流量消耗——【禁用移动数据】打开、【禁用WLAN】打开、【可在后台使用数据】关闭。"
+        "name": "Button E",
+        "content": "https://example.com/link3"
     }
 ]
 ```
-
-支持 UTF-8 和 GBK 编码（自动检测）。可以放任意多条，按钮会自适应排列。
