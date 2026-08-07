@@ -12,43 +12,37 @@
 - 鼠标悬停高亮效果
 - 高 DPI 支持（微软雅黑 10pt）
 - 单实例运行
-- Ctrl+W 关闭窗口
+- 系统托盘常驻服务
+- 支持绑定键盘触发键、组合键和鼠标键启动主面板
+- 托盘右键可开启/暂停快捷键监听、设置触发键、退出
+- 双击托盘图标可打开主面板
+- Ctrl+W 或关闭窗口会隐藏主面板，托盘菜单“退出”才会结束程序
 
 ## 编译
 
 需要 MinGW-w64：
 
 ```bash
-x86_64-w64-mingw32-gcc -O2 -mwindows -o QuickCopy.exe quick_copy.c json_helper.c -luser32 -lkernel32 -lgdi32 -lcomctl32 -lcomdlg32
+build.bat
 ```
 
 ## 使用
 
-在 exe 同目录下放 `links.json`，运行 QuickCopy.exe 即可。支持 UTF-8 和 GBK 编码（自动检测），可以放任意多条。
+在 exe 同目录下放 `links.json`（格式见下方），运行 QuickCopy.exe 即可。
 
-### links.json 示例
+触发键配置会保存到同目录下的 `quickcopy_hotkey.ini`。首次启动不会占用默认快捷键，需要在托盘菜单里自行设置。
+
+### links.json 格式
 
 ```json
 [
     {
-        "name": "Button A",
-        "content": "https://example.com/link1"
-    },
-    {
-        "name": "Button B",
-        "content": "Some text to copy"
-    },
-    {
-        "name": "Button C",
-        "content": "https://example.com/link2"
-    },
-    {
-        "name": "Button D",
-        "content": "Another sample text"
-    },
-    {
-        "name": "Button E",
-        "content": "https://example.com/link3"
+        "name": "按钮名称",
+        "content": "点击后复制的内容"
     }
 ]
 ```
+
+支持 UTF-8 和 GBK 编码（自动检测）。
+
+当前轻量解析器面向固定格式使用：最多读取 256 个按钮，单个 `name` 或 `content` 最多 4095 个宽字符。

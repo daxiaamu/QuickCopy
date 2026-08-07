@@ -1,16 +1,12 @@
-# Binaries
-QuickCopy*.exe
+# Build outputs
+*.exe
 *.o
 
-# Config / Data
+# Local config / data
 links.json
+quickcopy_hotkey.ini
 
-# Build
-build.bat
-
-# Manifest
-app.manifest
-app.rc
-
-# Git
-.git/
+# Codex/local metadata
+.agents/
+.codex/
+.gitrepo/
