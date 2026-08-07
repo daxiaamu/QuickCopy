@@ -167,7 +167,6 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR cmd, int ns) {
     ShowWindow(hw, ns);
     UpdateWindow(hw);
 
-    RegisterHotKey(hw, 1, MOD_CONTROL, 'W');
     InitTray();
     g_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowKeyboardProc, h, 0);
     g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, LowMouseProc, h, 0);
@@ -884,8 +883,8 @@ LRESULT CALLBACK WndP(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break;
     }
-    case WM_HOTKEY:
-        if (w == 1) HideMainPanel();
+    case WM_KEYDOWN:
+        if (w == 'W' && (GetKeyState(VK_CONTROL) & 0x8000)) HideMainPanel();
         break;
     case WM_CLOSE:
         if (g_exiting) {
@@ -896,7 +895,6 @@ LRESULT CALLBACK WndP(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_DESTROY:
         RemoveTray();
-        UnregisterHotKey(h, 1);
         if (g_keyboard_hook) UnhookWindowsHookEx(g_keyboard_hook);
         if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
         if (g_settings_window) DestroyWindow(g_settings_window);
