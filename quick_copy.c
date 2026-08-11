@@ -296,7 +296,6 @@ void FormatBinding(const HotkeyBinding* hotkey, WCHAR* buffer, int buffer_count)
 
     if (hotkey->type == QC_INPUT_MOUSE) {
         switch (hotkey->code) {
-        case VK_LBUTTON: wcscpy_s(input, 64, L"Mouse Left"); break;
         case VK_RBUTTON: wcscpy_s(input, 64, L"Mouse Right"); break;
         case VK_MBUTTON: wcscpy_s(input, 64, L"Mouse Middle"); break;
         case VK_XBUTTON1: wcscpy_s(input, 64, L"XButton1"); break;
@@ -500,8 +499,13 @@ void UpdateSettingsText(void) {
     SetDlgItemTextW(g_settings_window, ID_LABEL_CURRENT, current_text);
     SetDlgItemTextW(g_settings_window, ID_LABEL_HELP,
         g_recording_hotkey
-            ? L"请按下新的键盘键或鼠标键，可同时按住 Ctrl / Alt / Shift / Win。"
-            : L"点击“录制触发键”，再按下键盘键或鼠标键。");
+            ? L"等待输入：键盘键，或鼠标右键/中键/侧键。组合键可按住 Ctrl / Alt / Shift / Win。"
+            : L"点击“录制触发键”后，按键盘键或鼠标右键/中键/侧键。");
+    SetDlgItemTextW(g_settings_window, ID_RECORD,
+        g_recording_hotkey
+            ? L"正在录制..."
+            : (g_binding.code == 0 ? L"录制触发键" : L"重新录制触发键"));
+    EnableWindow(GetDlgItem(g_settings_window, ID_RESET), g_binding.code != 0 || g_recording_hotkey);
 }
 
 void ApplyFontToChildren(HWND h) {
@@ -517,17 +521,18 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     (void)l;
     switch (m) {
     case WM_CREATE:
-        CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE, 16, 16, 360, 24, h, (HMENU)ID_LABEL_CURRENT, mi, NULL);
-        CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE, 16, 46, 390, 42, h, (HMENU)ID_LABEL_HELP, mi, NULL);
-        CreateWindowW(L"BUTTON", L"录制触发键", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, 96, 128, 30, h, (HMENU)ID_RECORD, mi, NULL);
-        CreateWindowW(L"BUTTON", L"清除触发键", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 154, 96, 108, 30, h, (HMENU)ID_RESET, mi, NULL);
-        CreateWindowW(L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 272, 96, 80, 30, h, (HMENU)ID_CLOSE_SETTINGS, mi, NULL);
+        CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 16, 680, 24, h, (HMENU)ID_LABEL_CURRENT, mi, NULL);
+        CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 48, 690, 52, h, (HMENU)ID_LABEL_HELP, mi, NULL);
+        CreateWindowW(L"BUTTON", L"录制触发键", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, 112, 128, 30, h, (HMENU)ID_RECORD, mi, NULL);
+        CreateWindowW(L"BUTTON", L"清除触发键", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 154, 112, 108, 30, h, (HMENU)ID_RESET, mi, NULL);
+        CreateWindowW(L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 272, 112, 80, 30, h, (HMENU)ID_CLOSE_SETTINGS, mi, NULL);
         ApplyFontToChildren(h);
         UpdateSettingsText();
         return 0;
     case WM_COMMAND:
         if (LOWORD(w) == ID_RECORD) {
             g_recording_hotkey = TRUE;
+            InterlockedExchange(&g_trigger_held, 0);
             UpdateSettingsText();
             return 0;
         }
@@ -558,9 +563,13 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 void ShowSettingsWindow(void) {
+    g_recording_hotkey = FALSE;
+    InterlockedExchange(&g_trigger_held, 0);
+
     if (g_settings_window) {
         ShowWindow(g_settings_window, SW_SHOWNORMAL);
         SetForegroundWindow(g_settings_window);
+        UpdateSettingsText();
         return;
     }
 
@@ -577,7 +586,7 @@ void ShowSettingsWindow(void) {
         L"QuickCopyHotkeySettings",
         L"QuickCopy 触发键设置",
         WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 430, 180,
+        CW_USEDEFAULT, CW_USEDEFAULT, 740, 220,
         hw, NULL, mi, NULL);
     if (g_settings_window) {
         ShowWindow(g_settings_window, SW_SHOWNORMAL);
@@ -590,8 +599,9 @@ DWORD MouseCodeFromMessage(WPARAM message, LPARAM lparam, BOOL* is_down, BOOL* i
     *is_down = FALSE;
     *is_up = FALSE;
     switch (message) {
-    case WM_LBUTTONDOWN: *is_down = TRUE; return VK_LBUTTON;
-    case WM_LBUTTONUP: *is_up = TRUE; return VK_LBUTTON;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+        return 0;
     case WM_RBUTTONDOWN: *is_down = TRUE; return VK_RBUTTON;
     case WM_RBUTTONUP: *is_up = TRUE; return VK_RBUTTON;
     case WM_MBUTTONDOWN: *is_down = TRUE; return VK_MBUTTON;
@@ -859,6 +869,7 @@ LRESULT CALLBACK WndP(HWND h, UINT m, WPARAM w, LPARAM l) {
         InterlockedExchange(&g_trigger_held, 0);
         SaveHotkeyBinding();
         UpdateSettingsText();
+        if (g_settings_window) SetForegroundWindow(g_settings_window);
         RefreshTray();
         break;
     case WM_COMMAND: {
