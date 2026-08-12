@@ -31,6 +31,7 @@
 #define MENU_OPEN_PANEL 5002
 #define MENU_EDIT_HOTKEY 5003
 #define MENU_EXIT_APP 5004
+#define MENU_TOGGLE_AUTOSTART 5005
 
 #define ID_LABEL_CURRENT 6001
 #define ID_LABEL_HELP 6002
@@ -87,6 +88,8 @@ void UpdateSettingsText(void);
 void ApplyFontToChildren(HWND h);
 void LoadHotkeyBinding(void);
 void SaveHotkeyBinding(void);
+void InitAutoStart(void);
+BOOL SetAutoStart(BOOL enabled);
 void FormatBinding(const HotkeyBinding* hotkey, WCHAR* buffer, int buffer_count);
 DWORD CurrentModifiers(void);
 BOOL BindingMatches(DWORD type, DWORD code);
@@ -100,6 +103,7 @@ static HHOOK g_mouse_hook = NULL;
 static HICON g_tray_icon = NULL;
 static BOOL g_tray_icon_owned = FALSE;
 static BOOL g_service_enabled = TRUE;
+static BOOL g_autostart_enabled = FALSE;
 static BOOL g_recording_hotkey = FALSE;
 static BOOL g_exiting = FALSE;
 static LONG g_trigger_held = 0;
@@ -110,7 +114,7 @@ static HotkeyBinding g_recorded_binding = { QC_INPUT_KEYBOARD, 0, 0 };
 
 int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR cmd, int ns) {
     (void)hp;
-    (void)cmd;
+    BOOL start_hidden = cmd && strstr(cmd, "--startup") != NULL;
     InitCommonControls();
     SetProcessDPIAware();
 
@@ -133,6 +137,7 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR cmd, int ns) {
     wcscpy_s(hotkey_settings_path, MAX_PATH, ed);
     wcscat_s(hotkey_settings_path, MAX_PATH, L"\\quickcopy_hotkey.ini");
     LoadHotkeyBinding();
+    InitAutoStart();
 
     /* Create DPI-scaled font */
     HDC sdc = GetDC(0);
@@ -164,7 +169,7 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR cmd, int ns) {
         WS_CHILD|WS_VISIBLE|SS_CENTER,
         PD, PD, W1-PD*2, SH, hw, 0, h, 0);
 
-    ShowWindow(hw, ns);
+    ShowWindow(hw, start_hidden ? SW_HIDE : ns);
     UpdateWindow(hw);
 
     InitTray();
@@ -329,6 +334,45 @@ void SaveHotkeyBinding(void) {
     WritePrivateProfileStringW(L"hotkey", L"modifiers", value, hotkey_settings_path);
 }
 
+BOOL SetAutoStart(BOOL enabled) {
+    HKEY key = NULL;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_SET_VALUE, &key);
+    if (result != ERROR_SUCCESS) return FALSE;
+
+    if (enabled) {
+        WCHAR exe_path[MAX_PATH];
+        WCHAR command[MAX_PATH + 16];
+        if (!GetModuleFileNameW(NULL, exe_path, ARRAYSIZE(exe_path))) {
+            RegCloseKey(key);
+            return FALSE;
+        }
+        swprintf(command, ARRAYSIZE(command), L"\"%s\" --startup", exe_path);
+        result = RegSetValueExW(key, L"QuickCopy", 0, REG_SZ,
+            (const BYTE*)command, (DWORD)((wcslen(command) + 1) * sizeof(WCHAR)));
+    } else {
+        result = RegDeleteValueW(key, L"QuickCopy");
+        if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
+    }
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+void InitAutoStart(void) {
+    int configured = GetPrivateProfileIntW(L"startup", L"configured", 0, hotkey_settings_path);
+    BOOL desired = configured
+        ? GetPrivateProfileIntW(L"startup", L"enabled", 0, hotkey_settings_path) != 0
+        : TRUE;
+
+    g_autostart_enabled = SetAutoStart(desired) ? desired : FALSE;
+    if (!configured) {
+        WritePrivateProfileStringW(L"startup", L"configured", L"1", hotkey_settings_path);
+        WritePrivateProfileStringW(L"startup", L"enabled",
+            g_autostart_enabled ? L"1" : L"0", hotkey_settings_path);
+    }
+}
+
 DWORD CurrentModifiers(void) {
     DWORD mods = 0;
     if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= HK_CTRL;
@@ -465,6 +509,8 @@ void ShowTrayMenu(void) {
     AppendMenuW(menu, MF_STRING | (g_service_enabled ? MF_CHECKED : 0),
                 MENU_TOGGLE_SERVICE, g_service_enabled ? L"暂停快捷键监听" : L"开启快捷键监听");
     AppendMenuW(menu, MF_STRING, MENU_OPEN_PANEL, L"显示复制面板");
+    AppendMenuW(menu, MF_STRING | (g_autostart_enabled ? MF_CHECKED : 0),
+                MENU_TOGGLE_AUTOSTART, L"开机自启");
     AppendMenuW(menu, MF_STRING, MENU_EDIT_HOTKEY, L"设置触发键...");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, hotkey_text);
@@ -484,6 +530,15 @@ void ShowTrayMenu(void) {
         ShowMainPanel();
     } else if (cmd == MENU_EDIT_HOTKEY) {
         ShowSettingsWindow();
+    } else if (cmd == MENU_TOGGLE_AUTOSTART) {
+        BOOL desired = !g_autostart_enabled;
+        if (SetAutoStart(desired)) {
+            g_autostart_enabled = desired;
+            WritePrivateProfileStringW(L"startup", L"configured", L"1", hotkey_settings_path);
+            WritePrivateProfileStringW(L"startup", L"enabled", desired ? L"1" : L"0", hotkey_settings_path);
+        } else {
+            MessageBoxW(hw, L"无法修改开机自启设置。", L"QuickCopy", MB_OK | MB_ICONERROR);
+        }
     } else if (cmd == MENU_EXIT_APP) {
         g_exiting = TRUE;
         DestroyWindow(hw);
