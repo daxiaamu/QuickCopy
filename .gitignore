@@ -10,3 +10,12 @@ quickcopy_hotkey.ini
 .agents/
 .codex/
 .gitrepo/
+driver/x64/
+driver/Debug/
+driver/Release/
+driver/*.sys
+driver/*.cat
+driver/*.pdb
+*.obj
+driver/*.log
+driver/test-driver-verify.txt

@@ -4,6 +4,9 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
 #endif
+#ifndef MOD_NOREPEAT
+#define MOD_NOREPEAT 0x4000
+#endif
 
 #include <windows.h>
 #include <stdio.h>
@@ -12,6 +15,8 @@
 #include <shellapi.h>
 #include "json_helper.h"
 #include <commctrl.h>
+#include <setupapi.h>
+#include "driver/quickcopy_driver.h"
 
 #define MAXL 256
 #define BH 28
@@ -26,6 +31,8 @@
 #define WM_TRAY_CALLBACK (WM_APP + 10)
 #define WM_RECORDED_BINDING (WM_APP + 11)
 #define TRAY_ICON_ID 1
+#define SYSTEM_HOTKEY_ID 2
+#define HOTKEY_RESET_TIMER 3
 
 #define MENU_TOGGLE_SERVICE 5001
 #define MENU_OPEN_PANEL 5002
@@ -38,6 +45,12 @@
 #define ID_RECORD 6003
 #define ID_RESET 6004
 #define ID_CLOSE_SETTINGS 6005
+#define ID_MODE_ACTION 6006
+#define ID_LABEL_MODE 6007
+
+#define IDR_QUICKCOPY_DRIVER 201
+#define IDR_QUICKCOPY_INF 202
+#define IDR_QUICKCOPY_CAT 203
 
 #define QC_INPUT_KEYBOARD 0
 #define QC_INPUT_MOUSE 1
@@ -70,6 +83,10 @@ LRESULT CALLBACK BtnHoverProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 LRESULT CALLBACK SettingsProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK LowKeyboardProc(int, WPARAM, LPARAM);
 LRESULT CALLBACK LowMouseProc(int, WPARAM, LPARAM);
+BOOL InitKeyboardDriver(void);
+void UpdateKeyboardDriverBinding(void);
+void StopKeyboardDriver(void);
+DWORD WINAPI KeyboardDriverThread(LPVOID);
 DWORD WINAPI LdT(LPVOID);
 void MkB(HWND);
 void CpT(HWND, int);
@@ -77,7 +94,12 @@ void DrawBtn(const DRAWITEMSTRUCT* dis);
 int BtnIndex(HWND b);
 void MoveToStartPos(HWND h);
 void ShowMainPanel(void);
+void ActivateMainPanel(HWND h);
 void HideMainPanel(void);
+BOOL RegisterBackgroundInput(HWND h);
+void HandleRawInput(LPARAM lparam);
+void RefreshSystemHotkey(void);
+DWORD RawModifierBit(DWORD vk);
 void InitTray(void);
 void RemoveTray(void);
 void RefreshTray(void);
@@ -90,6 +112,14 @@ void LoadHotkeyBinding(void);
 void SaveHotkeyBinding(void);
 void InitAutoStart(void);
 BOOL SetAutoStart(BOOL enabled);
+BOOL IsDriverConfigured(void);
+BOOL InstallEmbeddedDriverElevated(void);
+int RunDriverInstaller(void);
+BOOL ExtractResourceToFile(WORD resource_id, const WCHAR* path);
+BOOL AddKeyboardUpperFilter(void);
+int ChooseInputMode(void);
+void SaveInputMode(void);
+BOOL EnableEnhancedMode(void);
 void FormatBinding(const HotkeyBinding* hotkey, WCHAR* buffer, int buffer_count);
 DWORD CurrentModifiers(void);
 BOOL BindingMatches(DWORD type, DWORD code);
@@ -100,6 +130,10 @@ static HFONT g_font = NULL;
 static HANDLE g_mu = NULL;
 static HHOOK g_keyboard_hook = NULL;
 static HHOOK g_mouse_hook = NULL;
+static HANDLE g_driver_handle = INVALID_HANDLE_VALUE;
+static HANDLE g_driver_trigger_event = NULL;
+static HANDLE g_driver_stop_event = NULL;
+static HANDLE g_driver_thread = NULL;
 static HICON g_tray_icon = NULL;
 static BOOL g_tray_icon_owned = FALSE;
 static BOOL g_service_enabled = TRUE;
@@ -107,6 +141,10 @@ static BOOL g_autostart_enabled = FALSE;
 static BOOL g_recording_hotkey = FALSE;
 static BOOL g_exiting = FALSE;
 static LONG g_trigger_held = 0;
+static DWORD g_raw_modifiers = 0;
+static BOOL g_system_hotkey_registered = FALSE;
+static BOOL g_mode_choice_made = FALSE;
+static BOOL g_prefer_enhanced_mode = FALSE;
 static UINT g_taskbar_created_message = 0;
 static HWND g_settings_window = NULL;
 static HotkeyBinding g_binding = { QC_INPUT_KEYBOARD, 0, 0 };
@@ -114,6 +152,8 @@ static HotkeyBinding g_recorded_binding = { QC_INPUT_KEYBOARD, 0, 0 };
 
 int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR cmd, int ns) {
     (void)hp;
+    mi = h;
+    if (cmd && strstr(cmd, "--install-driver") != NULL) return RunDriverInstaller();
     BOOL start_hidden = cmd && strstr(cmd, "--startup") != NULL;
     InitCommonControls();
     SetProcessDPIAware();
@@ -130,15 +170,20 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR cmd, int ns) {
         return 0;
     }
 
-    mi = h;
     GetModuleFileNameW(NULL, ed, MAX_PATH);
     wchar_t* p = wcsrchr(ed, 0x5C);
     if (p) *p = 0;
     wcscpy_s(hotkey_settings_path, MAX_PATH, ed);
     wcscat_s(hotkey_settings_path, MAX_PATH, L"\\quickcopy_hotkey.ini");
     LoadHotkeyBinding();
+    g_mode_choice_made = GetPrivateProfileIntW(L"mode", L"chosen", 0, hotkey_settings_path) != 0;
+    g_prefer_enhanced_mode = GetPrivateProfileIntW(L"mode", L"enhanced", 0, hotkey_settings_path) != 0;
+    if (!g_mode_choice_made && IsDriverConfigured()) {
+        g_mode_choice_made = TRUE;
+        g_prefer_enhanced_mode = TRUE;
+        SaveInputMode();
+    }
     InitAutoStart();
-
     /* Create DPI-scaled font */
     HDC sdc = GetDC(0);
     int dpi = GetDeviceCaps(sdc, LOGPIXELSY);
@@ -164,6 +209,8 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR cmd, int ns) {
         0, 0, h, 0);
     if (!hw) return 1;
     MoveToStartPos(hw);
+    RegisterBackgroundInput(hw);
+    RefreshSystemHotkey();
 
     hs = CreateWindowW(L"STATIC", L"loading...",
         WS_CHILD|WS_VISIBLE|SS_CENTER,
@@ -173,6 +220,7 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE hp, LPSTR cmd, int ns) {
     UpdateWindow(hw);
 
     InitTray();
+    if (g_prefer_enhanced_mode) InitKeyboardDriver();
     g_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowKeyboardProc, h, 0);
     g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, LowMouseProc, h, 0);
 
@@ -240,6 +288,183 @@ void MoveToStartPos(HWND h) {
 void ShowMainPanel(void) {
     if (!hw) return;
     PostMessageW(hw, WM_USER+4, 0, 0);
+}
+
+void ActivateMainPanel(HWND h) {
+    HWND foreground = GetForegroundWindow();
+    DWORD current_thread = GetCurrentThreadId();
+    DWORD foreground_thread = foreground ? GetWindowThreadProcessId(foreground, NULL) : 0;
+    BOOL attached = foreground_thread && foreground_thread != current_thread
+        ? AttachThreadInput(current_thread, foreground_thread, TRUE)
+        : FALSE;
+
+    ShowWindow(h, SW_SHOWNORMAL);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    SetFocus(h);
+
+    if (attached) AttachThreadInput(current_thread, foreground_thread, FALSE);
+}
+
+BOOL RegisterBackgroundInput(HWND h) {
+    RAWINPUTDEVICE devices[2] = {
+        { 0x01, 0x06, RIDEV_INPUTSINK, h },
+        { 0x01, 0x02, RIDEV_INPUTSINK, h }
+    };
+    return RegisterRawInputDevices(devices, ARRAYSIZE(devices), sizeof(devices[0]));
+}
+
+DWORD RawModifierBit(DWORD vk) {
+    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) return HK_CTRL;
+    if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) return HK_ALT;
+    if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) return HK_SHIFT;
+    if (vk == VK_LWIN || vk == VK_RWIN) return HK_WIN;
+    return 0;
+}
+
+void RefreshSystemHotkey(void) {
+    UnregisterHotKey(hw, SYSTEM_HOTKEY_ID);
+    g_system_hotkey_registered = FALSE;
+    if (!hw || g_binding.type != QC_INPUT_KEYBOARD || g_binding.code == 0) return;
+
+    UINT modifiers = MOD_NOREPEAT;
+    if (g_binding.modifiers & HK_CTRL) modifiers |= MOD_CONTROL;
+    if (g_binding.modifiers & HK_ALT) modifiers |= MOD_ALT;
+    if (g_binding.modifiers & HK_SHIFT) modifiers |= MOD_SHIFT;
+    if (g_binding.modifiers & HK_WIN) modifiers |= MOD_WIN;
+    g_system_hotkey_registered = RegisterHotKey(
+        hw, SYSTEM_HOTKEY_ID, modifiers, g_binding.code);
+}
+
+DWORD WINAPI KeyboardDriverThread(LPVOID param) {
+    HANDLE waits[2] = { g_driver_stop_event, g_driver_trigger_event };
+    (void)param;
+    for (;;) {
+        DWORD result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (result == WAIT_OBJECT_0) break;
+        if (result == WAIT_OBJECT_0 + 1) PostMessageW(hw, WM_USER+4, 0, 0);
+        else break;
+    }
+    return 0;
+}
+
+void UpdateKeyboardDriverBinding(void) {
+    QC_DRIVER_BINDING binding;
+    DWORD returned = 0;
+    UINT scan;
+    if (g_driver_handle == INVALID_HANDLE_VALUE) return;
+
+    ZeroMemory(&binding, sizeof(binding));
+    if (g_prefer_enhanced_mode && g_service_enabled && !g_recording_hotkey
+        && g_binding.type == QC_INPUT_KEYBOARD && g_binding.code != 0) {
+        scan = MapVirtualKeyW(g_binding.code, MAPVK_VK_TO_VSC_EX);
+        binding.MakeCode = (unsigned short)(scan & 0xFF);
+        if ((scan & 0xFF00) == 0xE000) binding.Flags |= QC_KEY_E0;
+        if ((scan & 0xFF00) == 0xE100) binding.Flags |= QC_KEY_E1;
+        binding.Modifiers = g_binding.modifiers;
+        binding.Enabled = binding.MakeCode != 0;
+    }
+    DeviceIoControl(g_driver_handle, IOCTL_QC_SET_BINDING,
+        &binding, sizeof(binding), NULL, 0, &returned, NULL);
+}
+
+BOOL InitKeyboardDriver(void) {
+    QC_DRIVER_EVENT registration;
+    DWORD returned = 0;
+    g_driver_handle = CreateFileW(QC_DRIVER_DEVICE_PATH,
+        GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_driver_handle == INVALID_HANDLE_VALUE) return FALSE;
+
+    g_driver_trigger_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_driver_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_driver_trigger_event || !g_driver_stop_event) {
+        StopKeyboardDriver();
+        return FALSE;
+    }
+
+    registration.EventHandle = (unsigned long long)(ULONG_PTR)g_driver_trigger_event;
+    if (!DeviceIoControl(g_driver_handle, IOCTL_QC_REGISTER_EVENT,
+            &registration, sizeof(registration), NULL, 0, &returned, NULL)) {
+        StopKeyboardDriver();
+        return FALSE;
+    }
+    UpdateKeyboardDriverBinding();
+    g_driver_thread = CreateThread(NULL, 0, KeyboardDriverThread, NULL, 0, NULL);
+    if (!g_driver_thread) {
+        StopKeyboardDriver();
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void StopKeyboardDriver(void) {
+    if (g_driver_stop_event) SetEvent(g_driver_stop_event);
+    if (g_driver_thread) {
+        WaitForSingleObject(g_driver_thread, 2000);
+        CloseHandle(g_driver_thread);
+        g_driver_thread = NULL;
+    }
+    if (g_driver_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_driver_handle);
+        g_driver_handle = INVALID_HANDLE_VALUE;
+    }
+    if (g_driver_trigger_event) {
+        CloseHandle(g_driver_trigger_event);
+        g_driver_trigger_event = NULL;
+    }
+    if (g_driver_stop_event) {
+        CloseHandle(g_driver_stop_event);
+        g_driver_stop_event = NULL;
+    }
+}
+void HandleRawInput(LPARAM lparam) {
+    RAWINPUT input;
+    UINT size = sizeof(input);
+    if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, &input, &size,
+                        sizeof(RAWINPUTHEADER)) == (UINT)-1) return;
+
+    if (input.header.dwType == RIM_TYPEKEYBOARD) {
+        DWORD code = input.data.keyboard.VKey;
+        BOOL up = (input.data.keyboard.Flags & RI_KEY_BREAK) != 0;
+        DWORD modifier = RawModifierBit(code);
+        if (modifier) {
+            if (up) g_raw_modifiers &= ~modifier;
+            else g_raw_modifiers |= modifier;
+            return;
+        }
+        if (code == 0 || code == 255) return;
+        if (!up && g_service_enabled && !g_recording_hotkey
+            && g_binding.type == QC_INPUT_KEYBOARD && g_binding.code == code
+            && g_raw_modifiers == g_binding.modifiers) {
+            if (InterlockedExchange(&g_trigger_held, 1) == 0) ShowMainPanel();
+        } else if (up && g_binding.type == QC_INPUT_KEYBOARD && g_binding.code == code) {
+            InterlockedExchange(&g_trigger_held, 0);
+        }
+        return;
+    }
+
+    if (input.header.dwType == RIM_TYPEMOUSE) {
+        USHORT flags = input.data.mouse.usButtonFlags;
+        DWORD code = 0;
+        BOOL down = FALSE, up = FALSE;
+        if (flags & RI_MOUSE_RIGHT_BUTTON_DOWN) { code = VK_RBUTTON; down = TRUE; }
+        else if (flags & RI_MOUSE_RIGHT_BUTTON_UP) { code = VK_RBUTTON; up = TRUE; }
+        else if (flags & RI_MOUSE_MIDDLE_BUTTON_DOWN) { code = VK_MBUTTON; down = TRUE; }
+        else if (flags & RI_MOUSE_MIDDLE_BUTTON_UP) { code = VK_MBUTTON; up = TRUE; }
+        else if (flags & RI_MOUSE_BUTTON_4_DOWN) { code = VK_XBUTTON1; down = TRUE; }
+        else if (flags & RI_MOUSE_BUTTON_4_UP) { code = VK_XBUTTON1; up = TRUE; }
+        else if (flags & RI_MOUSE_BUTTON_5_DOWN) { code = VK_XBUTTON2; down = TRUE; }
+        else if (flags & RI_MOUSE_BUTTON_5_UP) { code = VK_XBUTTON2; up = TRUE; }
+
+        if (down && g_service_enabled && !g_recording_hotkey
+            && g_binding.type == QC_INPUT_MOUSE && g_binding.code == code
+            && g_raw_modifiers == g_binding.modifiers) {
+            if (InterlockedExchange(&g_trigger_held, 1) == 0) ShowMainPanel();
+        } else if (up && g_binding.type == QC_INPUT_MOUSE && g_binding.code == code) {
+            InterlockedExchange(&g_trigger_held, 0);
+        }
+    }
 }
 
 void HideMainPanel(void) {
@@ -334,6 +559,235 @@ void SaveHotkeyBinding(void) {
     WritePrivateProfileStringW(L"hotkey", L"modifiers", value, hotkey_settings_path);
 }
 
+void SaveInputMode(void) {
+    WritePrivateProfileStringW(L"mode", L"chosen",
+        g_mode_choice_made ? L"1" : L"0", hotkey_settings_path);
+    WritePrivateProfileStringW(L"mode", L"enhanced",
+        g_prefer_enhanced_mode ? L"1" : L"0", hotkey_settings_path);
+}
+
+BOOL IsDriverConfigured(void) {
+    HKEY key = NULL;
+    DWORD type = 0, size = 0;
+    WCHAR* values = NULL;
+    BOOL found = FALSE;
+    LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E96B-E325-11CE-BFC1-08002BE10318}",
+        0, KEY_QUERY_VALUE, &key);
+    if (result != ERROR_SUCCESS) return FALSE;
+    result = RegQueryValueExW(key, L"UpperFilters", NULL, &type, NULL, &size);
+    if (result == ERROR_SUCCESS && type == REG_MULTI_SZ && size >= sizeof(WCHAR)) {
+        values = (WCHAR*)malloc(size + sizeof(WCHAR));
+        if (values && RegQueryValueExW(key, L"UpperFilters", NULL, &type,
+                (BYTE*)values, &size) == ERROR_SUCCESS) {
+            values[size / sizeof(WCHAR)] = 0;
+            for (WCHAR* value = values; *value; value += wcslen(value) + 1) {
+                if (_wcsicmp(value, L"QuickCopyKbd") == 0) { found = TRUE; break; }
+            }
+        }
+    }
+    if (values) free(values);
+    RegCloseKey(key);
+    return found;
+}
+
+BOOL ExtractResourceToFile(WORD resource_id, const WCHAR* path) {
+    HRSRC resource = FindResourceW(mi, MAKEINTRESOURCEW(resource_id), MAKEINTRESOURCEW(10));
+    if (!resource) return FALSE;
+    HGLOBAL loaded = LoadResource(mi, resource);
+    DWORD size = SizeofResource(mi, resource);
+    const void* data = loaded ? LockResource(loaded) : NULL;
+    if (!data || !size) return FALSE;
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    DWORD written = 0;
+    BOOL ok = WriteFile(file, data, size, &written, NULL) && written == size;
+    CloseHandle(file);
+    return ok;
+}
+
+BOOL AddKeyboardUpperFilter(void) {
+    HKEY key = NULL;
+    DWORD type = 0, size = 0;
+    WCHAR* oldValues = NULL;
+    WCHAR* newValues = NULL;
+    BOOL found = FALSE, ok = FALSE;
+    LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E96B-E325-11CE-BFC1-08002BE10318}",
+        0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key);
+    if (result != ERROR_SUCCESS) return FALSE;
+
+    result = RegQueryValueExW(key, L"UpperFilters", NULL, &type, NULL, &size);
+    if (result == ERROR_FILE_NOT_FOUND) { type = REG_MULTI_SZ; size = sizeof(WCHAR); }
+    if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND) goto done;
+    if (type != REG_MULTI_SZ) goto done;
+
+    oldValues = (WCHAR*)calloc(1, size + sizeof(WCHAR));
+    if (!oldValues) goto done;
+    if (result == ERROR_SUCCESS && RegQueryValueExW(key, L"UpperFilters", NULL,
+            &type, (BYTE*)oldValues, &size) != ERROR_SUCCESS) goto done;
+    for (WCHAR* value = oldValues; *value; value += wcslen(value) + 1) {
+        if (_wcsicmp(value, L"QuickCopyKbd") == 0) { found = TRUE; break; }
+    }
+    if (found) { ok = TRUE; goto done; }
+
+    size_t oldChars = size / sizeof(WCHAR);
+    size_t addChars = wcslen(L"QuickCopyKbd") + 1;
+    newValues = (WCHAR*)calloc(oldChars + addChars + 1, sizeof(WCHAR));
+    if (!newValues) goto done;
+    memcpy(newValues, oldValues, size);
+    size_t insert = oldChars > 1 ? oldChars - 1 : 0;
+    wcscpy_s(newValues + insert, addChars + 1, L"QuickCopyKbd");
+    ok = RegSetValueExW(key, L"UpperFilters", 0, REG_MULTI_SZ,
+        (BYTE*)newValues, (DWORD)((insert + addChars + 1) * sizeof(WCHAR))) == ERROR_SUCCESS;
+
+done:
+    if (newValues) free(newValues);
+    if (oldValues) free(oldValues);
+    RegCloseKey(key);
+    return ok;
+}
+
+int RunDriverInstaller(void) {
+    WCHAR tempRoot[MAX_PATH], packagePath[MAX_PATH];
+    WCHAR sysSource[MAX_PATH], infSource[MAX_PATH], catSource[MAX_PATH];
+    WCHAR systemPath[MAX_PATH];
+    SC_HANDLE manager = NULL, service = NULL;
+    int result = 0;
+    BOOL pendingMove = FALSE;
+
+    if (!GetTempPathW(ARRAYSIZE(tempRoot), tempRoot)) return 10;
+    swprintf(packagePath, ARRAYSIZE(packagePath), L"%sQuickCopyDriver_%lu",
+        tempRoot, GetCurrentProcessId());
+    if (!CreateDirectoryW(packagePath, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return 10;
+    swprintf(sysSource, ARRAYSIZE(sysSource), L"%s\\QuickCopyKbd.sys", packagePath);
+    swprintf(infSource, ARRAYSIZE(infSource), L"%s\\QuickCopyKbd.inf", packagePath);
+    swprintf(catSource, ARRAYSIZE(catSource), L"%s\\QuickCopyKbd.cat", packagePath);
+    if (!ExtractResourceToFile(IDR_QUICKCOPY_DRIVER, sysSource)
+        || !ExtractResourceToFile(IDR_QUICKCOPY_INF, infSource)
+        || !ExtractResourceToFile(IDR_QUICKCOPY_CAT, catSource)) {
+        result = 11; goto cleanup;
+    }
+    if (!SetupCopyOEMInfW(infSource, packagePath, SPOST_PATH, 0,
+            NULL, 0, NULL, NULL)) {
+        result = 12; goto cleanup;
+    }
+    if (!GetSystemDirectoryW(systemPath, ARRAYSIZE(systemPath))) {
+        result = 13; goto cleanup;
+    }
+    wcscat_s(systemPath, ARRAYSIZE(systemPath), L"\\drivers\\QuickCopyKbd.sys");
+    if (!CopyFileW(sysSource, systemPath, FALSE)) {
+        DWORD copyError = GetLastError();
+        if ((copyError == ERROR_SHARING_VIOLATION || copyError == ERROR_ACCESS_DENIED)
+            && MoveFileExW(sysSource, systemPath,
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_DELAY_UNTIL_REBOOT)) {
+            pendingMove = TRUE;
+        } else {
+            result = 14; goto cleanup;
+        }
+    }
+
+    manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+    if (!manager) { result = 15; goto cleanup; }
+    service = OpenServiceW(manager, L"QuickCopyKbd", SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS);
+    if (!service) {
+        service = CreateServiceW(manager, L"QuickCopyKbd", L"QuickCopy Keyboard Filter",
+            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS, SERVICE_KERNEL_DRIVER,
+            SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
+            L"System32\\drivers\\QuickCopyKbd.sys", NULL, NULL, NULL, NULL, NULL);
+    } else {
+        ChangeServiceConfigW(service, SERVICE_NO_CHANGE, SERVICE_DEMAND_START,
+            SERVICE_ERROR_NORMAL, L"System32\\drivers\\QuickCopyKbd.sys",
+            NULL, NULL, NULL, NULL, NULL, L"QuickCopy Keyboard Filter");
+    }
+    if (!service) { result = 16; goto cleanup; }
+    if (!AddKeyboardUpperFilter()) result = 17;
+
+cleanup:
+    if (service) CloseServiceHandle(service);
+    if (manager) CloseServiceHandle(manager);
+    DeleteFileW(catSource);
+    DeleteFileW(infSource);
+    if (!pendingMove) {
+        DeleteFileW(sysSource);
+        RemoveDirectoryW(packagePath);
+    }
+    return result;
+}
+BOOL InstallEmbeddedDriverElevated(void) {
+    WCHAR exePath[MAX_PATH];
+    SHELLEXECUTEINFOW info;
+    ZeroMemory(&info, sizeof(info));
+    GetModuleFileNameW(NULL, exePath, ARRAYSIZE(exePath));
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"runas";
+    info.lpFile = exePath;
+    info.lpParameters = L"--install-driver";
+    info.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&info)) return FALSE;
+    WaitForSingleObject(info.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(info.hProcess, &exitCode);
+    CloseHandle(info.hProcess);
+    return exitCode == 0;
+}
+
+BOOL EnableEnhancedMode(void) {
+    if (!IsDriverConfigured() && !InstallEmbeddedDriverElevated()) {
+        MessageBoxW(g_settings_window,
+            L"增强模式安装失败，系统未做重启操作。",
+            L"QuickCopy", MB_OK | MB_ICONERROR);
+        return FALSE;
+    }
+    g_mode_choice_made = TRUE;
+    g_prefer_enhanced_mode = TRUE;
+    SaveInputMode();
+    StopKeyboardDriver();
+    InitKeyboardDriver();
+    UpdateSettingsText();
+    if (g_driver_handle == INVALID_HANDLE_VALUE) {
+        MessageBoxW(g_settings_window,
+            L"增强模式已安装，需要重启 Windows 后生效。现在可以继续设置触发键。",
+            L"QuickCopy", MB_OK | MB_ICONINFORMATION);
+    }
+    return TRUE;
+}
+int ChooseInputMode(void) {
+    TASKDIALOG_BUTTON buttons[] = {
+        { 7001, L"使用普通模式" },
+        { 7002, L"安装增强模式" }
+    };
+    TASKDIALOGCONFIG config;
+    int selected = 0;
+    ZeroMemory(&config, sizeof(config));
+    config.cbSize = sizeof(config);
+    config.hwndParent = g_settings_window;
+    config.hInstance = mi;
+    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    config.pszWindowTitle = L"QuickCopy 触发模式";
+    config.pszMainInstruction = L"选择触发模式";
+    config.pszContent = L"普通模式无需驱动和重启；增强模式需要管理员安装并在重启后支持远程软件场景。";
+    config.cButtons = ARRAYSIZE(buttons);
+    config.pButtons = buttons;
+    config.nDefaultButton = 7001;
+    HMODULE controls = LoadLibraryW(L"comctl32.dll");
+    HRESULT (WINAPI *showDialog)(const TASKDIALOGCONFIG*, int*, int*, BOOL*) =
+        controls ? (void*)GetProcAddress(controls, "TaskDialogIndirect") : NULL;
+    if (showDialog) {
+        HRESULT result = showDialog(&config, &selected, NULL, NULL);
+        FreeLibrary(controls);
+        if (FAILED(result)) return 0;
+    } else {
+        if (controls) FreeLibrary(controls);
+        int fallback = MessageBoxW(g_settings_window,
+            L"选择“是”安装增强模式；选择“否”使用普通模式。",
+            L"选择触发模式", MB_YESNOCANCEL | MB_ICONQUESTION);
+        selected = fallback == IDYES ? 7002 : (fallback == IDNO ? 7001 : 0);
+    }
+    return selected;
+}
 BOOL SetAutoStart(BOOL enabled) {
     HKEY key = NULL;
     LONG result = RegOpenKeyExW(HKEY_CURRENT_USER,
@@ -525,6 +979,7 @@ void ShowTrayMenu(void) {
     if (cmd == MENU_TOGGLE_SERVICE) {
         g_service_enabled = !g_service_enabled;
         InterlockedExchange(&g_trigger_held, 0);
+        UpdateKeyboardDriverBinding();
         RefreshTray();
     } else if (cmd == MENU_OPEN_PANEL) {
         ShowMainPanel();
@@ -552,6 +1007,19 @@ void UpdateSettingsText(void) {
     FormatBinding(&g_binding, hotkey_text, 128);
     swprintf(current_text, 192, L"当前快捷键：%s", hotkey_text);
     SetDlgItemTextW(g_settings_window, ID_LABEL_CURRENT, current_text);
+    if (g_prefer_enhanced_mode) {
+        SetDlgItemTextW(g_settings_window, ID_LABEL_MODE,
+            g_driver_handle != INVALID_HANDLE_VALUE
+                ? L"当前模式：增强模式"
+                : (IsDriverConfigured()
+                    ? L"当前模式：增强模式（等待重启）"
+                    : L"当前模式：增强模式（未安装）"));
+        SetDlgItemTextW(g_settings_window, ID_MODE_ACTION, L"切换到普通模式");
+    } else {
+        SetDlgItemTextW(g_settings_window, ID_LABEL_MODE, L"当前模式：普通模式");
+        SetDlgItemTextW(g_settings_window, ID_MODE_ACTION,
+            IsDriverConfigured() ? L"启用增强模式" : L"安装增强模式");
+    }
     SetDlgItemTextW(g_settings_window, ID_LABEL_HELP,
         g_recording_hotkey
             ? L"等待输入：键盘键，或鼠标右键/中键/侧键。组合键可按住 Ctrl / Alt / Shift / Win。"
@@ -577,18 +1045,45 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE:
         CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 16, 680, 24, h, (HMENU)ID_LABEL_CURRENT, mi, NULL);
-        CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 48, 690, 52, h, (HMENU)ID_LABEL_HELP, mi, NULL);
-        CreateWindowW(L"BUTTON", L"录制触发键", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, 112, 128, 30, h, (HMENU)ID_RECORD, mi, NULL);
-        CreateWindowW(L"BUTTON", L"清除触发键", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 154, 112, 108, 30, h, (HMENU)ID_RESET, mi, NULL);
-        CreateWindowW(L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 272, 112, 80, 30, h, (HMENU)ID_CLOSE_SETTINGS, mi, NULL);
+        CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 46, 480, 24, h, (HMENU)ID_LABEL_MODE, mi, NULL);
+        CreateWindowW(L"BUTTON", L"安装增强模式", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 510, 40, 150, 30, h, (HMENU)ID_MODE_ACTION, mi, NULL);
+        CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 80, 690, 52, h, (HMENU)ID_LABEL_HELP, mi, NULL);
+        CreateWindowW(L"BUTTON", L"录制触发键", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, 144, 128, 30, h, (HMENU)ID_RECORD, mi, NULL);
+        CreateWindowW(L"BUTTON", L"清除触发键", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 154, 144, 108, 30, h, (HMENU)ID_RESET, mi, NULL);
+        CreateWindowW(L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 272, 144, 80, 30, h, (HMENU)ID_CLOSE_SETTINGS, mi, NULL);
         ApplyFontToChildren(h);
         UpdateSettingsText();
         return 0;
     case WM_COMMAND:
         if (LOWORD(w) == ID_RECORD) {
+            if (!g_mode_choice_made) {
+                int mode = ChooseInputMode();
+                if (mode == 7001) {
+                    g_mode_choice_made = TRUE;
+                    g_prefer_enhanced_mode = FALSE;
+                    SaveInputMode();
+                } else if (mode == 7002) {
+                    if (!EnableEnhancedMode()) return 0;
+                } else {
+                    return 0;
+                }
+            }
             g_recording_hotkey = TRUE;
             InterlockedExchange(&g_trigger_held, 0);
+            UpdateKeyboardDriverBinding();
             UpdateSettingsText();
+            return 0;
+        }
+        if (LOWORD(w) == ID_MODE_ACTION) {
+            if (g_prefer_enhanced_mode) {
+                g_prefer_enhanced_mode = FALSE;
+                g_mode_choice_made = TRUE;
+                SaveInputMode();
+                UpdateKeyboardDriverBinding();
+                UpdateSettingsText();
+            } else {
+                EnableEnhancedMode();
+            }
             return 0;
         }
         if (LOWORD(w) == ID_RESET) {
@@ -597,6 +1092,8 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_binding.modifiers = 0;
             g_recording_hotkey = FALSE;
             SaveHotkeyBinding();
+            RefreshSystemHotkey();
+            UpdateKeyboardDriverBinding();
             UpdateSettingsText();
             RefreshTray();
             return 0;
@@ -611,6 +1108,7 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_DESTROY:
         g_recording_hotkey = FALSE;
+        UpdateKeyboardDriverBinding();
         g_settings_window = NULL;
         return 0;
     }
@@ -620,6 +1118,7 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 void ShowSettingsWindow(void) {
     g_recording_hotkey = FALSE;
     InterlockedExchange(&g_trigger_held, 0);
+    UpdateKeyboardDriverBinding();
 
     if (g_settings_window) {
         ShowWindow(g_settings_window, SW_SHOWNORMAL);
@@ -641,7 +1140,7 @@ void ShowSettingsWindow(void) {
         L"QuickCopyHotkeySettings",
         L"QuickCopy 触发键设置",
         WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 740, 220,
+        CW_USEDEFAULT, CW_USEDEFAULT, 740, 260,
         hw, NULL, mi, NULL);
     if (g_settings_window) {
         ShowWindow(g_settings_window, SW_SHOWNORMAL);
@@ -908,9 +1407,11 @@ LRESULT CALLBACK WndP(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_USER+2: if (hs) SetWindowTextW(hs, L"parse error"); break;
     case WM_USER+3: if (hs) SetWindowTextW(hs, L"load error"); break;
     case WM_USER+4:
-        ShowWindow(h, SW_SHOWNORMAL);
-        SetForegroundWindow(h);
+        ActivateMainPanel(h);
         break;
+    case WM_INPUT:
+        HandleRawInput(l);
+        return 0;
     case WM_TRAY_CALLBACK:
         if (l == WM_RBUTTONUP || l == WM_CONTEXTMENU) {
             ShowTrayMenu();
@@ -923,9 +1424,17 @@ LRESULT CALLBACK WndP(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_recording_hotkey = FALSE;
         InterlockedExchange(&g_trigger_held, 0);
         SaveHotkeyBinding();
+        RefreshSystemHotkey();
+        UpdateKeyboardDriverBinding();
         UpdateSettingsText();
         if (g_settings_window) SetForegroundWindow(g_settings_window);
         RefreshTray();
+        break;
+    case WM_HOTKEY:
+        if (w == SYSTEM_HOTKEY_ID && g_service_enabled && !g_recording_hotkey) {
+            if (InterlockedExchange(&g_trigger_held, 1) == 0) ShowMainPanel();
+            SetTimer(h, HOTKEY_RESET_TIMER, 250, NULL);
+        }
         break;
     case WM_COMMAND: {
         int id = LOWORD(w);
@@ -942,6 +1451,11 @@ LRESULT CALLBACK WndP(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_TIMER: {
         int id = (int)w;
+        if (id == HOTKEY_RESET_TIMER) {
+            KillTimer(h, id);
+            InterlockedExchange(&g_trigger_held, 0);
+            break;
+        }
         if (id>=2000 && id<2000+gn) {
             int i = id-2000;
             KillTimer(h, id);
@@ -961,6 +1475,8 @@ LRESULT CALLBACK WndP(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_DESTROY:
         RemoveTray();
+        UnregisterHotKey(h, SYSTEM_HOTKEY_ID);
+        StopKeyboardDriver();
         if (g_keyboard_hook) UnhookWindowsHookEx(g_keyboard_hook);
         if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
         if (g_settings_window) DestroyWindow(g_settings_window);
